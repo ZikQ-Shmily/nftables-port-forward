@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh nftables domain targets
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nft-domain-update

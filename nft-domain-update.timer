@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh nftables domain targets every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=nft-domain-update.service
+
+[Install]
+WantedBy=timers.target
