@@ -13,6 +13,9 @@ SYSCTL_CONF="/etc/sysctl.d/99-nft-forward.conf"
 LOG_FILE="/var/log/nft-forward.log"
 LOGROTATE_CONF="/etc/logrotate.d/nft-forward"
 TABLE_NAME="port_forward"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DOMAIN_MAP="${CONF_DIR}/domain-targets.json"
+DOMAIN_CONTROL="${SCRIPT_DIR}/domain-control.py"
 
 # ============== 日志函数 ==============
 log_action() {
@@ -62,6 +65,71 @@ validate_ip() {
             return 1
         fi
     done
+    return 0
+}
+
+# ============== 域名映射与更新服务 ==============
+domain_control() {
+    if [[ "$1" == "get" && ! -f "$DOMAIN_MAP" ]]; then echo ""; return 0; fi
+    if [[ "$1" == "delete" && ! -f "$DOMAIN_MAP" ]]; then return 0; fi
+    if [[ "$1" == "clear" && ! -f "$DOMAIN_MAP" ]]; then return 0; fi
+    if ! command -v python3 >/dev/null || [[ ! -f "$DOMAIN_CONTROL" || ! -f "${SCRIPT_DIR}/nft-domain-update.py" ]]; then
+        err "需要 Python 3 和项目中的域名工具文件。" >&2
+        return 1
+    fi
+    python3 "$DOMAIN_CONTROL" --file "$DOMAIN_MAP" "$@"
+}
+
+domain_requirements() {
+    local f
+    for f in domain-control.py nft-domain-update.py nft-domain-update.service nft-domain-update.timer; do
+        [[ -f "${SCRIPT_DIR}/$f" ]] || { err "缺少项目文件 $f，请完整下载项目。"; return 1; }
+    done
+    for f in python3 getent systemctl; do
+        command -v "$f" >/dev/null || { err "缺少 $f，请安装后重试。"; return 1; }
+    done
+}
+
+setup_domain_timer() {
+    if ! install -m 0755 "${SCRIPT_DIR}/nft-domain-update.py" /usr/local/sbin/nft-domain-update ||
+       ! install -m 0644 "${SCRIPT_DIR}/nft-domain-update.service" /etc/systemd/system/nft-domain-update.service ||
+       ! install -m 0644 "${SCRIPT_DIR}/nft-domain-update.timer" /etc/systemd/system/nft-domain-update.timer ||
+       ! systemctl daemon-reload || ! systemctl enable --now nft-domain-update.timer; then
+        warn "规则已保存，但域名定时更新启用失败。请检查 systemctl 和依赖。"
+        return 1
+    fi
+    info "已启用域名定时更新（每 5 分钟检查）。"
+    warn "请确认 FORWARD 防火墙规则允许变化后的目标 IP；域名更新不修改其他防火墙规则。"
+}
+
+# 所有菜单写入共享同一锁；失败时恢复配置与域名映射。
+save_rules_with_binding() {
+    local action="$1" port="${2:-}" domain="${3:-}" old_conf old_map had_map=0
+    old_conf=$(mktemp "${CONF_DIR}/.rules-backup.XXXXXXXX") || return 1
+    if ! cp -p "$CONF_FILE" "$old_conf"; then rm -f "$old_conf"; return 1; fi
+    old_map=$(mktemp "${CONF_DIR}/.domains-backup.XXXXXXXX") || { rm -f "$old_conf"; return 1; }
+    if [[ -f "$DOMAIN_MAP" ]]; then
+        had_map=1
+        if ! cp -p "$DOMAIN_MAP" "$old_map"; then rm -f "$old_conf" "$old_map"; return 1; fi
+    fi
+    if ! domain_control "$action" "$port" "$domain"; then
+        err "域名映射未保存，规则未更改。"
+        rm -f "$old_conf" "$old_map"
+        return 1
+    fi
+    if ! write_conf_file || ! reload_rules; then
+        if ! mv -f "$old_conf" "$CONF_FILE"; then
+            err "恢复规则配置失败，备份位于 $old_conf。"
+        fi
+        if (( had_map )); then
+            if ! mv -f "$old_map" "$DOMAIN_MAP"; then err "恢复域名映射失败，备份位于 $old_map。"; fi
+        else
+            rm -f "$DOMAIN_MAP" "$old_map"
+        fi
+        err "规则更新失败，已尝试恢复原配置。"
+        return 1
+    fi
+    rm -f "$old_conf" "$old_map"
     return 0
 }
 
@@ -776,11 +844,13 @@ do_list() {
     echo "──────────────────────────────────────────────────────"
 
     local idx=1
-    local rule lport dip dport
+    local rule lport dip dport domain
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport dip dport <<< "$rule"
-        printf "%-6s %-10s %-10s -> %-22s\n" \
-            "$idx" "tcp+udp" "$lport" "${dip}:${dport}"
+        domain=$(domain_control get "$lport") || { err "读取域名映射失败。"; return 1; }
+        printf "%-6s %-10s %-10s -> %s" "$idx" "tcp+udp" "$lport" "${dip}:${dport}"
+        [[ -z "$domain" ]] || printf " (%s)" "$domain"
+        printf "\n"
         ((idx++))
     done
     echo ""
@@ -833,14 +903,18 @@ do_add() {
         return
     fi
 
-    # 输入目标 IP
-    local dip
+    # 将域名解析为 IPv4，内核规则仍保存解析出的地址。
+    local dip dest domain=""
     while true; do
-        read -rp "请输入目标 IP 地址: " dip
-        if validate_ip "$dip"; then
+        read -rp "请输入目标 IPv4 地址或域名: " dest
+        if validate_ip "$dest"; then dip="$dest"; domain=""; break; fi
+        if ! domain_requirements; then return 1; fi
+        if dip=$(domain_control resolve "$dest") && validate_ip "$dip"; then
+            domain="$dest"
+            info "${domain} -> ${dip}"
             break
         fi
-        err "IP 地址格式无效，请重新输入（如 192.168.1.100，不含前导零）。"
+        err "域名解析失败或无 IPv4 地址，请重新输入。"
     done
 
     # 输入目标端口
@@ -857,27 +931,22 @@ do_add() {
     # 确认
     echo ""
     echo "即将添加转发规则:"
-    echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+    echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport} ${domain:+(${domain})}"
     read -rp "确认添加？[Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
         info "已取消。"
         return
     fi
 
-    # 备份并写入
     backup_conf
     RULES+=("${lport}|${dip}|${dport}")
-    if ! write_conf_file; then
-        return
-    fi
-
-    if reload_rules; then
+    local action=delete
+    [[ -z "$domain" ]] || action=set
+    if save_rules_with_binding "$action" "$lport" "$domain"; then
         firewall_open_port "$lport" "$dip" "$dport"
-        info "转发规则添加成功: ${lport} → ${dip}:${dport}"
+        info "转发规则添加成功: ${lport} → ${dip}:${dport} ${domain:+(${domain})}"
         log_action "新增转发: ${lport} -> ${dip}:${dport}"
-        info "若转发不通，请使用菜单中的【诊断/自检】排查。"
-    else
-        err "规则加载失败，请检查配置。"
+        if [[ -n "$domain" ]]; then setup_domain_timer || true; fi
     fi
 }
 
@@ -898,20 +967,8 @@ do_delete() {
         return
     fi
 
-    # 展示列表
-    printf "\n\033[1m%-6s %-10s %-10s    %-20s\033[0m\n" "序号" "协议" "本机端口" "目标地址"
-    echo "────────────────────────────────────────────────────"
-
-    local idx=1
+    do_list || return
     local rule lport dip dport
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport <<< "$rule"
-        printf "%-6s %-10s %-10s -> %-20s\n" \
-            "$idx" "tcp+udp" "$lport" "${dip}:${dport}"
-        ((idx++))
-    done
-    echo ""
-
     # 选择删除
     local choice
     read -rp "请输入要删除的序号 (0 取消): " choice
@@ -921,7 +978,7 @@ do_delete() {
         return
     fi
 
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
+    if [[ ! "$choice" =~ ^[1-9][0-9]*$ ]] || (( choice > ${#RULES[@]} )); then
         err "无效的序号。"
         return
     fi
@@ -937,22 +994,13 @@ do_delete() {
         return
     fi
 
-    # 备份并移除
     backup_conf
     unset 'RULES[$((choice-1))]'
     RULES=("${RULES[@]}")
-
-    if ! write_conf_file; then
-        return
-    fi
-
-    if reload_rules; then
-        # nft 规则已成功更新后，再清理防火墙放行（RULES 已移除该条，dest_still_used 能正确判断）
+    if save_rules_with_binding delete "$lport"; then
         firewall_close_port "$lport" "$dip" "$dport"
         info "转发规则已删除: ${lport} → ${dip}:${dport}"
         log_action "删除转发: ${lport} -> ${dip}:${dport}"
-    else
-        err "规则加载失败，请检查配置。"
     fi
 }
 
@@ -960,74 +1008,51 @@ do_delete() {
 # 功能：修改现有转发目标
 # ====================================================
 do_edit() {
-    if ! command -v nft &>/dev/null; then
-        err "nftables 未安装。"
-        return
-    fi
+    if ! command -v nft &>/dev/null; then err "nftables 未安装。"; return; fi
     load_rules
-    if (( ${#RULES[@]} == 0 )); then
-        info "当前没有转发规则。"
-        return
-    fi
-    do_list
-    local choice target lport old_ip old_port new_ip new_port confirm saved
+    if (( ${#RULES[@]} == 0 )); then info "当前没有转发规则。"; return; fi
+    do_list || return
+    local choice target lport old_ip old_port old_domain new_ip new_port dest domain confirm action
     read -rp "请输入要修改的序号 (0 取消): " choice
     if [[ -z "$choice" || "$choice" == 0 ]]; then return; fi
-    if [[ ! "$choice" =~ ^[1-9][0-9]*$ ]] || (( choice > ${#RULES[@]} )); then
-        err "无效的序号。"
-        return
-    fi
+    if [[ ! "$choice" =~ ^[1-9][0-9]*$ ]] || (( choice > ${#RULES[@]} )); then err "无效的序号。"; return; fi
     target="${RULES[$((choice-1))]}"
     IFS='|' read -r lport old_ip old_port <<< "$target"
+    old_domain=$(domain_control get "$lport") || return
     while true; do
-        read -rp "目标 IPv4 地址 [${old_ip}]: " new_ip
-        new_ip="${new_ip:-$old_ip}"
-        validate_ip "$new_ip" && break
-        err "IPv4 地址无效。"
+        read -rp "目标 IPv4 或域名 [${old_domain:-$old_ip}]: " dest
+        if [[ -z "$dest" ]]; then new_ip="$old_ip"; domain="$old_domain"; break; fi
+        if validate_ip "$dest"; then new_ip="$dest"; domain=""; break; fi
+        if ! domain_requirements; then return 1; fi
+        if new_ip=$(domain_control resolve "$dest") && validate_ip "$new_ip"; then
+            domain="$dest"; info "${domain} -> ${new_ip}"; break
+        fi
+        err "域名解析失败或无 IPv4 地址，请重新输入。"
     done
+    if [[ -n "$domain" ]] && ! domain_requirements; then return 1; fi
     while true; do
         read -rp "目标端口 [${old_port}]: " new_port
         new_port="${new_port:-$old_port}"
         validate_port "$new_port" && break
         err "端口无效。"
     done
-    if [[ "$new_ip" == "$old_ip" && "$new_port" == "$old_port" ]]; then
-        info "目标没有变化。"
-        return
-    fi
-    if [[ -f /etc/nftables.d/domain-targets.json ]]; then
-        warn "如果端口 ${lport} 已绑定域名，定时更新可能再次修改目标 IP。"
-        warn "要改为固定 IP，请同时从 domain-targets.json 删除此端口的映射。"
-    fi
-    echo "本机端口 ${lport}: ${old_ip}:${old_port} -> ${new_ip}:${new_port} (tcp+udp)"
+    if [[ "$new_ip" == "$old_ip" && "$new_port" == "$old_port" && "$domain" == "$old_domain" ]]; then info "目标没有变化。"; return; fi
+    echo "本机端口 ${lport}: ${old_ip}:${old_port} -> ${new_ip}:${new_port} ${domain:+(${domain})} (tcp+udp)"
     read -rp "确认修改？[y/N]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return; }
-    saved=$(mktemp "${CONF_DIR}/.port-forward-edit.XXXXXXXX") || { err "无法创建备份。"; return; }
-    if ! cp -p "${CONF_FILE}" "$saved"; then
-        rm "$saved"
-        err "无法备份配置。"
-        return
-    fi
     backup_conf
     RULES[$((choice-1))]="${lport}|${new_ip}|${new_port}"
-    if ! write_conf_file; then
-        rm "$saved"
-        return
-    fi
-    if ! reload_rules; then
-        if ! mv -f "$saved" "${CONF_FILE}"; then
-            err "无法恢复配置；备份保存在 ${saved}。"
-        else
-            err "已恢复修改前的配置。"
+    action=delete
+    [[ -z "$domain" ]] || action=set
+    if save_rules_with_binding "$action" "$lport" "$domain"; then
+        if [[ "$old_ip" != "$new_ip" || "$old_port" != "$new_port" ]]; then
+            firewall_close_port "$lport" "$old_ip" "$old_port"
+            firewall_open_port "$lport" "$new_ip" "$new_port"
         fi
-        return
+        info "转发目标已修改: ${lport} -> ${new_ip}:${new_port} ${domain:+(${domain})}"
+        log_action "修改转发: ${lport} ${old_ip}:${old_port} -> ${new_ip}:${new_port}"
+        if [[ -n "$domain" ]]; then setup_domain_timer || true; fi
     fi
-    rm "$saved"
-    # Existing helper retains shared destination allow rules when still used.
-    firewall_close_port "$lport" "$old_ip" "$old_port"
-    firewall_open_port "$lport" "$new_ip" "$new_port"
-    info "转发目标已修改: ${lport} -> ${new_ip}:${new_port}"
-    log_action "修改转发: ${lport} ${old_ip}:${old_port} -> ${new_ip}:${new_port}"
 }
 
 # ====================================================
@@ -1055,24 +1080,16 @@ do_clear_all() {
     fi
 
     backup_conf
-
-    # 先清理所有防火墙规则（清空场景用 force，无需检查共享）
     local rule lport dip dport
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport <<< "$rule"
-        firewall_close_port "$lport" "$dip" "$dport" "force"
-    done
-
+    local -a previous_rules=("${RULES[@]}")
     RULES=()
-    if ! write_conf_file; then
-        return
-    fi
-
-    if reload_rules; then
+    if save_rules_with_binding clear; then
+        for rule in "${previous_rules[@]}"; do
+            IFS='|' read -r lport dip dport <<< "$rule"
+            firewall_close_port "$lport" "$dip" "$dport" "force"
+        done
         info "所有转发规则已清空。"
         log_action "清空所有转发规则"
-    else
-        err "规则加载失败，请检查配置。"
     fi
 }
 

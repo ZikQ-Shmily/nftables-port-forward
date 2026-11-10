@@ -46,8 +46,12 @@ def load_mapping(path):
             result[key] = value
         return result
     data = json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=unique_pairs)
-    if not isinstance(data, dict) or not data:
-        raise ValueError('映射文件必须是非空 JSON 对象')
+    return validate_mapping(data)
+
+
+def validate_mapping(data):
+    if not isinstance(data, dict):
+        raise ValueError('映射文件必须是 JSON 对象')
     clean = {}
     for port, domain in data.items():
         if not isinstance(port, str) or not re.fullmatch(r'[1-9][0-9]{0,4}', port) or int(port) > 65535:
@@ -121,6 +125,9 @@ def nft_run(config, check=False):
 
 def update():
     mapping = load_mapping(MAPPING)
+    if not mapping:
+        print('没有配置域名目标。')
+        return 0
     original = CONF.read_text(encoding='utf-8')
     # Validate the entire managed layout before any DNS or firewall operation.
     transform(original, {})
