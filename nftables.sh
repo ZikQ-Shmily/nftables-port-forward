@@ -39,14 +39,8 @@ check_root() {
 # ============== 输入验证 ==============
 validate_port() {
     local port="$1"
-    # 拒绝非纯数字、前导零（避免 bash 八进制歧义）、空串
-    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" =~ ^0[0-9] ]]; then
-        return 1
-    fi
-    if (( port < 1 || port > 65535 )); then
-        return 1
-    fi
-    return 0
+    # 先检查位数和前导零，再进行数值比较。
+    [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 ))
 }
 
 validate_ip() {
@@ -73,6 +67,7 @@ domain_control() {
     if [[ "$1" == "get" && ! -f "$DOMAIN_MAP" ]]; then echo ""; return 0; fi
     if [[ "$1" == "delete" && ! -f "$DOMAIN_MAP" ]]; then return 0; fi
     if [[ "$1" == "clear" && ! -f "$DOMAIN_MAP" ]]; then return 0; fi
+    if [[ "$1" == "replace" && -z "${3:-}" && ! -f "$DOMAIN_MAP" ]]; then return 0; fi
     if ! command -v python3 >/dev/null || [[ ! -f "$DOMAIN_CONTROL" || ! -f "${SCRIPT_DIR}/nft-domain-update.py" ]]; then
         err "需要 Python 3 和项目中的域名工具文件。" >&2
         return 1
@@ -104,7 +99,7 @@ setup_domain_timer() {
 
 # 所有菜单写入共享同一锁；失败时恢复配置与域名映射。
 save_rules_with_binding() {
-    local action="$1" port="${2:-}" domain="${3:-}" old_conf old_map had_map=0
+    local old_conf old_map had_map=0
     old_conf=$(mktemp "${CONF_DIR}/.rules-backup.XXXXXXXX") || return 1
     if ! cp -p "$CONF_FILE" "$old_conf"; then rm -f "$old_conf"; return 1; fi
     old_map=$(mktemp "${CONF_DIR}/.domains-backup.XXXXXXXX") || { rm -f "$old_conf"; return 1; }
@@ -112,7 +107,7 @@ save_rules_with_binding() {
         had_map=1
         if ! cp -p "$DOMAIN_MAP" "$old_map"; then rm -f "$old_conf" "$old_map"; return 1; fi
     fi
-    if ! domain_control "$action" "$port" "$domain"; then
+    if ! domain_control "$@"; then
         err "域名映射未保存，规则未更改。"
         rm -f "$old_conf" "$old_map"
         return 1
@@ -322,13 +317,23 @@ check_port_conflict() {
     fi
     if [[ -n "$conflict" ]]; then
         warn "本机端口 ${port} 已被其他服务占用（${conflict}）。"
-        warn "添加转发后，该端口的外部流量将被转发，本地服务可能无法从外部访问。"
-        read -rp "是否仍要继续添加转发规则？[y/N]: " ans
+        warn "设置转发后，该端口的外部流量将被转发，本地服务可能无法从外部访问。"
+        local ans
+        read -rp "是否继续使用此端口？[y/N]: " ans || return 1
         if [[ ! "$ans" =~ ^[Yy]$ ]]; then
             return 1
         fi
     fi
     return 0
+}
+
+# ============== 查询本机端口是否已有转发 ==============
+local_port_in_use() {
+    local rule
+    for rule in "${RULES[@]}"; do
+        [[ "${rule%%|*}" == "$1" ]] && return 0
+    done
+    return 1
 }
 
 # ============== 初始化配置文件结构 ==============
@@ -888,14 +893,10 @@ do_add() {
     done
 
     # 检查端口是否已有转发规则
-    local rule rp
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r rp _ _ <<< "$rule"
-        if [[ "$rp" == "$lport" ]]; then
-            err "本机端口 ${lport} 已存在转发规则，请先删除后再添加。"
-            return
-        fi
-    done
+    if local_port_in_use "$lport"; then
+        err "本机端口 ${lport} 已存在转发规则，请先删除后再添加。"
+        return
+    fi
 
     # 检查端口占用（TCP + UDP）
     if ! check_port_conflict "$lport"; then
@@ -1005,22 +1006,37 @@ do_delete() {
 }
 
 # ====================================================
-# 功能：修改现有转发目标
+# 功能：修改现有转发规则
 # ====================================================
 do_edit() {
     if ! command -v nft &>/dev/null; then err "nftables 未安装。"; return; fi
     load_rules
     if (( ${#RULES[@]} == 0 )); then info "当前没有转发规则。"; return; fi
     do_list || return
-    local choice target lport old_ip old_port old_domain new_ip new_port dest domain confirm action
-    read -rp "请输入要修改的序号 (0 取消): " choice
+    local choice target lport new_lport old_ip old_port old_domain new_ip new_port dest domain confirm
+    read -rp "请输入要修改的序号 (0 取消): " choice || return 0
     if [[ -z "$choice" || "$choice" == 0 ]]; then return; fi
     if [[ ! "$choice" =~ ^[1-9][0-9]*$ ]] || (( choice > ${#RULES[@]} )); then err "无效的序号。"; return; fi
     target="${RULES[$((choice-1))]}"
     IFS='|' read -r lport old_ip old_port <<< "$target"
     old_domain=$(domain_control get "$lport") || return
     while true; do
-        read -rp "目标 IPv4 或域名 [${old_domain:-$old_ip}]: " dest
+        read -rp "本机监听端口 [${lport}]: " new_lport || return 0
+        new_lport="${new_lport:-$lport}"
+        if ! validate_port "$new_lport"; then
+            err "端口无效，请输入 1-65535 之间的数字。"
+        elif [[ "$new_lport" != "$lport" ]] && local_port_in_use "$new_lport"; then
+            err "本机端口 ${new_lport} 已存在转发规则。"
+        else
+            break
+        fi
+    done
+    if [[ "$new_lport" != "$lport" ]] && ! check_port_conflict "$new_lport"; then
+        info "已取消。"
+        return
+    fi
+    while true; do
+        read -rp "目标 IPv4 或域名 [${old_domain:-$old_ip}]: " dest || return 0
         if [[ -z "$dest" ]]; then new_ip="$old_ip"; domain="$old_domain"; break; fi
         if validate_ip "$dest"; then new_ip="$dest"; domain=""; break; fi
         if ! domain_requirements; then return 1; fi
@@ -1031,26 +1047,31 @@ do_edit() {
     done
     if [[ -n "$domain" ]] && ! domain_requirements; then return 1; fi
     while true; do
-        read -rp "目标端口 [${old_port}]: " new_port
+        read -rp "目标端口 [${old_port}]: " new_port || return 0
         new_port="${new_port:-$old_port}"
         validate_port "$new_port" && break
         err "端口无效。"
     done
-    if [[ "$new_ip" == "$old_ip" && "$new_port" == "$old_port" && "$domain" == "$old_domain" ]]; then info "目标没有变化。"; return; fi
-    echo "本机端口 ${lport}: ${old_ip}:${old_port} -> ${new_ip}:${new_port} ${domain:+(${domain})} (tcp+udp)"
-    read -rp "确认修改？[y/N]: " confirm
+    if [[ "$new_lport" == "$lport" && "$new_ip" == "$old_ip" && "$new_port" == "$old_port" && "$domain" == "$old_domain" ]]; then
+        info "规则没有变化。"
+        return
+    fi
+    printf '修改前: %s -> %s:%s%s (TCP+UDP)\n' "$lport" "$old_ip" "$old_port" "${old_domain:+ ($old_domain)}"
+    printf '修改后: %s -> %s:%s%s (TCP+UDP)\n' "$new_lport" "$new_ip" "$new_port" "${domain:+ ($domain)}"
+    read -rp "确认修改？[y/N]: " confirm || return 0
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return; }
     backup_conf
-    RULES[$((choice-1))]="${lport}|${new_ip}|${new_port}"
-    action=delete
-    [[ -z "$domain" ]] || action=set
-    if save_rules_with_binding "$action" "$lport" "$domain"; then
-        if [[ "$old_ip" != "$new_ip" || "$old_port" != "$new_port" ]]; then
+    RULES[$((choice-1))]="${new_lport}|${new_ip}|${new_port}"
+    if save_rules_with_binding replace "$lport" "$domain" --new-port "$new_lport"; then
+        if [[ "$new_lport" != "$lport" ]]; then
+            firewall_open_port "$new_lport" "$new_ip" "$new_port"
+            firewall_close_port "$lport" "$old_ip" "$old_port"
+        elif [[ "$old_ip" != "$new_ip" || "$old_port" != "$new_port" ]]; then
             firewall_close_port "$lport" "$old_ip" "$old_port"
             firewall_open_port "$lport" "$new_ip" "$new_port"
         fi
-        info "转发目标已修改: ${lport} -> ${new_ip}:${new_port} ${domain:+(${domain})}"
-        log_action "修改转发: ${lport} ${old_ip}:${old_port} -> ${new_ip}:${new_port}"
+        info "转发规则已修改: ${new_lport} -> ${new_ip}:${new_port}${domain:+ ($domain)}"
+        log_action "修改转发: ${lport} -> ${old_ip}:${old_port} 改为 ${new_lport} -> ${new_ip}:${new_port}"
         if [[ -n "$domain" ]]; then setup_domain_timer || true; fi
     fi
 }
@@ -1108,7 +1129,7 @@ main_menu() {
         echo "  4) 删除端口转发"
         echo "  5) 一键清空所有转发"
         echo "  6) 诊断/自检"
-        echo "  7) 修改转发目标"
+        echo "  7) 修改转发规则"
         echo "  8) 退出"
         echo "========================================"
         read -rp "请选择操作 [1-8]: " choice

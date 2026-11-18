@@ -17,9 +17,10 @@ spec.loader.exec_module(updater)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--file', required=True)
-    parser.add_argument('action', choices=['get', 'set', 'delete', 'clear', 'resolve'])
+    parser.add_argument('action', choices=['get', 'set', 'delete', 'clear', 'resolve', 'replace'])
     parser.add_argument('port', nargs='?')
     parser.add_argument('domain', nargs='?')
+    parser.add_argument('--new-port')
     args = parser.parse_args()
     path = Path(args.file)
     if args.action == 'resolve':
@@ -36,6 +37,16 @@ def main():
     if args.action == 'set':
         updater.validate_mapping({args.port: args.domain})
         data[args.port] = args.domain
+    elif args.action == 'replace':
+        if not args.port or not args.new_port:
+            parser.error('replace requires an existing port and --new-port')
+        if args.domain:
+            updater.validate_mapping({args.new_port: args.domain})
+        data.pop(args.port, None)
+        if args.domain:
+            data[args.new_port] = args.domain
+        else:
+            data.pop(args.new_port, None)
     elif args.action == 'delete':
         data.pop(args.port, None)
     elif args.action == 'clear':
