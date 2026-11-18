@@ -10,7 +10,15 @@
 
 ## 使用
 
-需要具备 root 权限的 Linux、Bash、nftables、systemd 和 `flock`（通常来自 util-linux）。域名自动更新另需 Python 3 和 `getent`。克隆项目或下载文件后：
+需要具备 root 权限的 Linux、Bash、nftables、systemd 和 `flock`（通常来自 util-linux）。域名自动更新另需 Python 3 和 `getent`。
+
+用 `wget` 下载完整项目并启动菜单。压缩包包含域名转发所需的配套文件。
+
+```bash
+wget -O nftables-port-forward.tar.gz https://github.com/ZikQ-Shmily/nftables-port-forward/archive/refs/heads/main.tar.gz && tar -xzf nftables-port-forward.tar.gz && cd nftables-port-forward-main && sudo bash nftables.sh
+```
+
+也可以通过 Git 克隆并启动菜单。
 
 ```bash
 git clone https://github.com/ZikQ-Shmily/nftables-port-forward.git && cd nftables-port-forward && sudo bash nftables.sh
@@ -22,7 +30,7 @@ git clone https://github.com/ZikQ-Shmily/nftables-port-forward.git && cd nftable
 
 新增转发时直接输入域名即可，脚本会解析 IPv4、写入转发规则并尝试启用 systemd 定时器；如果启用失败会给出提示。选择列表可以看到 `IP:端口 (域名)`，旧版本的域名映射也会读取。只改本地监听端口时，已有域名绑定会迁移到新端口。修改目标为固定 IP、删除规则或清空规则时，脚本会同步更新域名映射。
 
-已有项目目录的用户可在该目录运行 `git pull --ff-only && sudo bash nftables.sh` 更新和启动。脚本运行期间不需要选择安装功能；选择安装并确认可能清空现有规则。
+通过 Git 克隆的用户可在项目目录运行 `git pull --ff-only && sudo bash nftables.sh` 更新和启动。脚本运行期间不需要选择安装功能；选择安装并确认可能清空现有规则。
 
 一个域名只使用一个 IPv4；当前 IP 仍在解析结果中时优先保留。DNS 查询失败保留旧值，已建立的连接可能继续使用旧 IP。域名更新器更新本工具的 NAT 规则，**不会更新其他防火墙中的 FORWARD 放行规则**。如果其放行规则限定旧目标 IP，DNS 更新后可能无法连接；需事先设置适当的过滤规则。仅支持本工具生成的规则格式。
 
